@@ -4,7 +4,7 @@
 
 package akka.stream.scaladsl
 
-import akka.NotUsed
+import akka.{ Done, NotUsed }
 import akka.actor.Status.Failure
 import akka.actor.{ Actor, ActorIdentity, ActorLogging, ActorRef, ActorSystem, ActorSystemImpl, Identify, Props }
 import akka.pattern._
@@ -42,6 +42,26 @@ object StreamRefsSpec {
         val ref: Future[SourceRef[String]] = source.runWith(StreamRefs.sourceRef())
 
         ref.pipeTo(sender())
+
+      case "give-nothing-watch" =>
+        val source: Source[String, NotUsed] = Source.fromFuture(Future.never.mapTo[String])
+        val (done: Future[Done], ref: Future[SourceRef[String]]) =
+          source.watchTermination()(Keep.right).toMat(StreamRefs.sourceRef())(Keep.both).run()
+
+        ref.pipeTo(sender())
+
+        import context.dispatcher
+        done.pipeTo(sender())
+
+      case "give-only-one-watch" =>
+        val source: Source[String, NotUsed] = Source.single("hello").concat(Source.fromFuture(Future.never))
+        val (done: Future[Done], ref: Future[SourceRef[String]]) =
+          source.watchTermination()(Keep.right).toMat(StreamRefs.sourceRef())(Keep.both).run()
+
+        ref.pipeTo(sender())
+
+        import context.dispatcher
+        done.pipeTo(sender())
 
       case "give-infinite" =>
         val source: Source[String, NotUsed] = Source.fromIterator(() => Iterator.from(1)).map("ping-" + _)
@@ -88,6 +108,28 @@ object StreamRefsSpec {
           StreamRefs.sinkRef[String]().to(Sink.actorRef(probe, "<COMPLETE>")).run()
 
         sink.pipeTo(sender())
+
+      case "receive-one-shutdown" =>
+        // will shutdown the stream after the first element using a kill switch
+        val (sink, done) =
+          StreamRefs
+            .sinkRef[String]()
+            .viaMat(KillSwitches.single)(Keep.both)
+            .alsoToMat(Sink.head)(Keep.both)
+            .mapMaterializedValue {
+              case ((sink, ks), firstF) =>
+                // shutdown the stream after first element
+                firstF.foreach(_ => ks.shutdown())(context.dispatcher)
+                sink
+            }
+            .watchTermination()(Keep.both)
+            .to(Sink.actorRef(probe, "<COMPLETE>", f => "<FAILED>: " + f.getMessage))
+            .run()
+
+        sink.pipeTo(sender())
+
+        import context.dispatcher
+        done.pipeTo(sender())
 
       case "receive-ignore" =>
         val sink =
@@ -295,6 +337,32 @@ class StreamRefsSpec(config: Config) extends AkkaSpec(config) with ImplicitSende
 
       Await.result(done, 8.seconds)
     }
+
+    "local shutdown should trigger remote shutdown" in {
+      remoteActor ! "give-only-one-watch"
+      val sourceRef = expectMsgType[SourceRef[String]]
+
+      val ks =
+        sourceRef.viaMat(KillSwitches.single)(Keep.right).to(Sink.actorRef(p.ref, "<COMPLETE>", _ => "<FAILED>")).run()
+
+      p.expectMsg("hello")
+      ks.shutdown()
+      p.expectMsg("<COMPLETE>")
+      expectMsg(Done)
+    }
+
+    "local shutdown should trigger remote shutdown when no elements have been emitted" in {
+      remoteActor ! "give-nothing-watch"
+      val sourceRef = expectMsgType[SourceRef[String]]
+
+      val ks =
+        sourceRef.viaMat(KillSwitches.single)(Keep.right).to(Sink.actorRef(p.ref, "<COMPLETE>", _ => "<FAILED>")).run()
+
+      ks.shutdown()
+      p.expectMsg("<COMPLETE>")
+      expectMsg(Done)
+    }
+
   }
 
   "A SinkRef" must {
@@ -394,6 +462,24 @@ class StreamRefsSpec(config: Config) extends AkkaSpec(config) with ImplicitSende
 
       // if we get this message, it means no checks in the request/expect semantics were broken, good!
       p.expectMsg("<COMPLETED>")
+    }
+
+    "remote shutdown should trigger local shutdown" in {
+      remoteActor ! "receive-one-shutdown"
+      val remoteSink: SinkRef[String] = expectMsgType[SinkRef[String]]
+
+      val done =
+        Source
+          .single("hello")
+          .concat(Source.fromFuture(Future.never))
+          .watchTermination()(Keep.right)
+          .to(remoteSink)
+          .run()
+
+      p.expectMsg("hello")
+      p.expectMsg("<COMPLETE>")
+      expectMsg(Done)
+      Await.result(done, 5.seconds) shouldBe Done
     }
 
     "not allow materializing multiple times" in {
