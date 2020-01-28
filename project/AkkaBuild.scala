@@ -66,7 +66,7 @@ object AkkaBuild {
     UnidocRoot.akkaSettings,
     Protobuf.settings,
     parallelExecution in GlobalScope := System.getProperty("akka.parallelExecution", parallelExecutionByDefault.toString).toBoolean,
-    version in ThisBuild := akkaVersion,
+    version in ThisBuild := "2.6.1-i3",
     // used for linking to API docs (overwrites `project-info.version`)
     ThisBuild / projectInfoVersion := { if (isSnapshot.value) "snapshot" else version.value }
   )

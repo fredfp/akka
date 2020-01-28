@@ -217,6 +217,7 @@ object Dependencies {
   val slf4j = l ++= Seq(slf4jApi, Test.logback)
 
   val persistence = l ++= Seq(
+        slf4jApi,
         Provided.levelDB,
         Provided.levelDBNative,
         Test.scalatest.value,

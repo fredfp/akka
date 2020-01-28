@@ -29,11 +29,34 @@ trait AsyncWriteJournal extends Actor with WriteJournalBase with AsyncRecovery {
   private val publish = extension.settings.internal.publishPluginCommands
   private val config = extension.configFor(self)
 
+  private def logBreakerStateAround[F](showCall: String)(block: => Future[F]): Future[F] = {
+    def breakerStatusString: String =
+      s"isClosed:${breaker.isClosed} isOpen:${breaker.isOpen} isHalfOpen:${breaker.isHalfOpen} currentFailureCount:${breaker.currentFailureCount}"
+    breakerLogging.debug(s"before $showCall - $breakerStatusString")
+    Try(block) match {
+      case Success(f) =>
+        breakerLogging.debug(s"after $showCall - $breakerStatusString")
+        // use global to catch errors that happen on actor shutdown
+        f.failed.foreach(t => breakerLogging.error(s"failed $showCall", t))(scala.concurrent.ExecutionContext.global)
+        f
+      case Failure(f) =>
+        breakerLogging.error(s"crashed $showCall - $breakerStatusString", f)
+        throw f
+    }
+  }
+
   private val breaker = {
     val maxFailures = config.getInt("circuit-breaker.max-failures")
     val callTimeout = config.getDuration("circuit-breaker.call-timeout", MILLISECONDS).millis
     val resetTimeout = config.getDuration("circuit-breaker.reset-timeout", MILLISECONDS).millis
     CircuitBreaker(context.system.scheduler, maxFailures, callTimeout, resetTimeout)
+      .onCallBreakerOpen(breakerLogging.debug("onCallBreakerOpen"))
+      .onCallFailure(duration => breakerLogging.debug(s"onCallFailure(${duration.nanos.toMillis}ms)"))
+      .onCallSuccess(duration => breakerLogging.debug(s"onCallSuccess(${duration.nanos.toMillis}ms)"))
+      .onCallTimeout(duration => breakerLogging.debug(s"onCallTimeout(${duration.nanos.toMillis}ms)"))
+      .onClose(breakerLogging.debug("onClose"))
+      .onHalfOpen(breakerLogging.debug("onHalfOpen"))
+      .onOpen(breakerLogging.debug("onOpen"))
   }
 
   private val replayFilterMode: ReplayFilter.Mode =
@@ -71,7 +94,8 @@ trait AsyncWriteJournal extends Actor with WriteJournalBase with AsyncRecovery {
         val writeResult = (prepared match {
           case Success(prep) =>
             // try in case the asyncWriteMessages throws
-            try breaker.withCircuitBreaker(asyncWriteMessages(prep))
+            try logBreakerStateAround(s"asyncWriteMessages(${messages.mkString(", ")} ~> ${prep.mkString(", ")})")(
+              breaker.withCircuitBreaker(asyncWriteMessages(prep)))
             catch { case NonFatal(e) => Future.failed(e) }
           case f @ Failure(_) =>
             // exception from preparePersistentBatch => rejected
@@ -149,8 +173,9 @@ trait AsyncWriteJournal extends Actor with WriteJournalBase with AsyncRecovery {
          * being called before a call to asyncReplayMessages even tho it currently always is. The Cassandra
          * plugin does rely on this so if you change this change the Cassandra plugin.
          */
-        breaker
-          .withCircuitBreaker(asyncReadHighestSequenceNr(persistenceId, readHighestSequenceNrFrom))
+        logBreakerStateAround(
+          s"asyncReadHighestSequenceNr(persistenceId: $persistenceId, readHighestSequenceNrFrom: $readHighestSequenceNrFrom")(
+          breaker.withCircuitBreaker(asyncReadHighestSequenceNr(persistenceId, readHighestSequenceNrFrom)))
           .flatMap { highSeqNr =>
             val toSeqNr = math.min(toSequenceNr, highSeqNr)
             if (toSeqNr <= 0L || fromSequenceNr > toSeqNr)
@@ -179,8 +204,8 @@ trait AsyncWriteJournal extends Actor with WriteJournalBase with AsyncRecovery {
           }
 
       case d @ DeleteMessagesTo(persistenceId, toSequenceNr, persistentActor) =>
-        breaker
-          .withCircuitBreaker(asyncDeleteMessagesTo(persistenceId, toSequenceNr))
+        logBreakerStateAround(s"asyncDeleteMessagesTo(persistenceId: $persistenceId, toSequenceNr: $toSequenceNr")(
+          breaker.withCircuitBreaker(asyncDeleteMessagesTo(persistenceId, toSequenceNr)))
           .map { _ =>
             DeleteMessagesSuccess(toSequenceNr)
           }
@@ -294,6 +319,9 @@ private[persistence] object AsyncWriteJournal {
 
   final case class Desequenced(msg: Any, snr: Long, target: ActorRef, sender: ActorRef)
       extends NoSerializationVerificationNeeded
+
+  // this needs to be here as for binary compatibility reasons, we can't add a field to a trait
+  private val breakerLogging = org.slf4j.LoggerFactory.getLogger("akka.persistence.breaker")
 
   class Resequencer extends Actor {
     import scala.collection.mutable.Map
